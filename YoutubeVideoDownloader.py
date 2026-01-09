@@ -1,33 +1,48 @@
 import os
+import threading
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 from yt_dlp import YoutubeDL
 
+# Variables globales pour le suivi de la progression
+current_progress = 0
+is_downloading = False
+download_completed = threading.Event()
 
-# Fonction pour mettre à jour la progression
+
+# Fonction pour mettre à jour la progression (appelée par yt-dlp)
 def progress_hook(d):
+    global current_progress
+
     if d['status'] == 'downloading':
+        # Calculer le pourcentage de progression
         total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
         downloaded_bytes = d.get('downloaded_bytes', 0)
 
-        # Éviter la division par zéro
         if total_bytes > 0:
-            percentage = (downloaded_bytes / total_bytes) * 100
-            # Mise à jour de la barre de progression (valeur entre 0 et 1)
-            progress_bar.set(percentage / 100)
-            # Arrondi à l'unité pour l'affichage du pourcentage
-            progress_label.configure(text=f"Progression : {int(percentage)}%")
-            root.update_idletasks()  # Mise à jour de l'interface
+            percentage = int((downloaded_bytes / total_bytes) * 100)
+            # Mise à jour de la barre de progression seulement si la progression augmente
+            if percentage > current_progress:
+                current_progress = percentage
+                progress_bar.set(percentage / 100)
+                progress_label.configure(text=f"Progression : {percentage}%")
+                root.update_idletasks()
+
+    elif d['status'] == 'finished':
+        progress_label.configure(text="Post-traitement en cours...")
+
     elif d['status'] == 'error':
         progress_label.configure(text="Erreur lors du téléchargement.")
-    elif d['status'] == 'finished':
-        progress_label.configure(text="Traitement en cours...")
-        # Ne pas définir progress_bar à 1.0 ici pour éviter le remplissage au début
-        # du deuxième téléchargement (vidéo + audio)
 
 
 # Fonction pour télécharger une vidéo ou un fichier MP3
 def download_video():
+    global current_progress, is_downloading
+
+    # Empêcher les téléchargements multiples
+    if is_downloading:
+        return
+
     url = video_url.get()
     folder = folder_path.get()
     format_choice = format_var.get()  # Choix : "video" ou "audio"
@@ -42,39 +57,40 @@ def download_video():
         return
 
     # Réinitialiser la barre de progression
-    progress_var.set(0)
+    current_progress = 0
+    progress_bar.set(0)
     progress_label.configure(text="Préparation du téléchargement...")
 
-    # Configurer les options pour yt-dlp
+    is_downloading = True
+    download_button.configure(state="disabled")  # Désactiver le bouton pendant le téléchargement
+
+    # Options de base pour yt-dlp
     ydl_opts = {
         'outtmpl': os.path.join(folder, '%(title)s.%(ext)s'),
-        'quiet': False,
-        'progress_hooks': [progress_hook],  # Fonction pour mettre à jour la progression
-        'noprogress': False,  # S'assurer que les hooks de progression sont appelés
+        'progress_hooks': [progress_hook],
     }
 
-    # Si l'utilisateur a sélectionné "audio", ajouter des options pour MP3
+    # Configurer les options selon le format choisi
     if format_choice == "audio":
         ydl_opts.update({
             'format': 'bestaudio/best',
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '192',
+                'preferredquality': '320',
             }],
         })
     else:
-        # Téléchargement en vidéo avec la qualité choisie
+        # Configuration pour la vidéo avec la qualité sélectionnée
         quality = quality_var.get()
 
-        # Correspondance des qualités avec les formats yt-dlp
         if quality == "1080p":
             format_spec = "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
         elif quality == "720p":
             format_spec = "bestvideo[height<=720]+bestaudio/best[height<=720]"
         elif quality == "480p":
             format_spec = "bestvideo[height<=480]+bestaudio/best[height<=480]"
-        else:  # Qualité automatique (meilleure disponible)
+        else:
             format_spec = "bestvideo+bestaudio/best"
 
         ydl_opts.update({
@@ -82,21 +98,39 @@ def download_video():
             'merge_output_format': 'mp4'
         })
 
-    try:
-        # Lancer le téléchargement avec yt-dlp dans une fonction séparée pour ne pas bloquer l'interface
-        with YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+    # Fonction pour le thread de téléchargement
+    def download_thread():
+        global is_downloading, current_progress
 
-        # Réinitialiser l'interface après le téléchargement
-        messagebox.showinfo("Succès", f"Le fichier a été téléchargé dans :\n{folder}")
-        progress_bar.set(0)  # Réinitialiser la barre de progression
-        progress_label.configure(text="Progression : 0%")
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
 
-    except Exception as e:
-        messagebox.showerror("Erreur", f"Une erreur s'est produite :\n{e}")
-        print(f"Erreur : {e}")  # Debug dans la console
-        progress_bar.set(0)
-        progress_label.configure(text="Progression : 0%")
+            # Mettre à jour l'interface après le téléchargement (dans le thread principal)
+            root.after(0, lambda: progress_bar.set(1.0))  # Mettre à 100%
+            root.after(0, lambda: progress_label.configure(text="Téléchargement terminé !"))
+            root.after(0, lambda: messagebox.showinfo("Succès", f"Le fichier a été téléchargé dans :\n{folder}"))
+            root.after(0, lambda: reset_progress())
+
+        except Exception as e:
+            # Gérer les erreurs dans le thread principal
+            root.after(0, lambda: messagebox.showerror("Erreur", f"Une erreur s'est produite :\n{e}"))
+            root.after(0, lambda: reset_progress())
+
+        finally:
+            is_downloading = False
+            root.after(0, lambda: download_button.configure(state="normal"))
+
+    # Démarrer le téléchargement dans un thread séparé
+    threading.Thread(target=download_thread, daemon=True).start()
+
+
+# Fonction pour réinitialiser la progression
+def reset_progress():
+    global current_progress
+    current_progress = 0
+    progress_bar.set(0)
+    progress_label.configure(text="Progression : 0%")
 
 
 # Fonction pour parcourir les dossiers
@@ -125,7 +159,6 @@ video_url = ctk.StringVar()
 folder_path = ctk.StringVar()
 format_var = ctk.StringVar(value="video")  # Par défaut, "video"
 quality_var = ctk.StringVar(value="720p")  # Par défaut, "720p"
-progress_var = ctk.DoubleVar(value=0)  # Variable pour la barre de progression (valeurs entre 0 et 1)
 
 # Observer les changements dans format_var
 format_var.trace_add("write", toggle_quality_menu)
@@ -168,16 +201,12 @@ audio_radio.pack(side="left", padx=10)
 # Menu déroulant pour choisir la qualité vidéo (visible uniquement quand "video" est sélectionné)
 quality_frame = ctk.CTkFrame(root)
 # Ne pas afficher le frame par défaut, la fonction toggle_quality_menu s'en chargera
-# lors de l'initialisation
 
 quality_label = ctk.CTkLabel(quality_frame, text="Qualité vidéo :")
 quality_label.pack(side="left", padx=5)
 
 quality_menu = ctk.CTkOptionMenu(quality_frame, variable=quality_var, values=["480p", "720p", "1080p"])
 quality_menu.pack(side="left", padx=5)
-
-# Appeler toggle_quality_menu pour initialiser correctement l'affichage du menu de qualité
-toggle_quality_menu()
 
 # Bouton de téléchargement
 download_button = ctk.CTkButton(root, text="Télécharger", command=download_video, fg_color="green",
@@ -194,6 +223,9 @@ progress_bar.set(0)  # Initialiser à 0
 
 progress_label = ctk.CTkLabel(progress_frame, text="Progression : 0%")
 progress_label.pack(pady=5)
+
+# Appeler toggle_quality_menu pour initialiser correctement l'affichage du menu de qualité
+toggle_quality_menu()
 
 # Lancement de l'interface
 root.mainloop()
